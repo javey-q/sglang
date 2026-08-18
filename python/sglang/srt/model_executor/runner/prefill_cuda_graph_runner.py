@@ -715,9 +715,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.dllm_config is not None:
-            # Only scheduler-declared pure prefill may reuse the ordinary
-            # EXTEND graph. Decode stays on DLLM_EXTEND and its decode graph.
-            if not forward_batch.is_dllm_prefill:
+            # Only scheduler-declared multi-block prefill may reuse the
+            # ordinary EXTEND graph. Decode and single-block prefill stay on
+            # DLLM_EXTEND and its decode graph.
+            if not forward_batch.is_dllm_multi_block_prefill:
                 return False
             if forward_batch.forward_mode != ForwardMode.EXTEND:
                 return False
@@ -1103,7 +1104,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             dllm_config=forward_batch.dllm_config,
-            is_dllm_prefill=forward_batch.is_dllm_prefill,
+            dllm_batch_mode=forward_batch.dllm_batch_mode,
             sampling_info=forward_batch.sampling_info,
             mm_inputs=forward_batch.mm_inputs,
             temperature=forward_batch.temperature,

@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmBatchMode
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -456,7 +457,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
-        dllm_is_prefill: bool = False,
+        dllm_batch_mode: Optional[DllmBatchMode] = None,
         waiting_queue_len: int = 0,
     ):
         self.page_size = page_size
@@ -469,7 +470,9 @@ class PrefillAdder:
         self.dllm_config = dllm_config
 
         if self.dllm_config is not None:
-            self._init_dllm_meta(dllm_config, dllm_is_prefill)
+            if dllm_batch_mode is None:
+                raise ValueError("dllm_batch_mode is required when dllm_config is set")
+            self._init_dllm_meta(dllm_config, dllm_batch_mode)
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
@@ -549,13 +552,25 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
-    def _init_dllm_meta(self, dllm_config: DllmConfig, is_prefill: bool):
+    def _init_dllm_meta(
+        self,
+        dllm_config: DllmConfig,
+        dllm_batch_mode: DllmBatchMode,
+    ):
         self.dllm_block_size = dllm_config.block_size
-        self.dllm_prefill_block_size = dllm_config.prefill_block_size
+        self.dllm_batch_mode = dllm_batch_mode
+        # Single-block prefill runs on the fixed-block DLLM_EXTEND path, whose
+        # positions cover exactly one block per request.
+        self.dllm_prefill_block_size = (
+            dllm_config.prefill_block_size
+            if dllm_batch_mode.is_multi_block_prefill
+            else dllm_config.block_size
+        )
         max_running_reqs = dllm_config.max_running_requests
-
         per_req_budget = (
-            self.dllm_prefill_block_size if is_prefill else self.dllm_block_size
+            self.dllm_prefill_block_size
+            if dllm_batch_mode.is_prefill
+            else self.dllm_block_size
         )
         self.rem_dllm_tokens = max_running_reqs * per_req_budget
 

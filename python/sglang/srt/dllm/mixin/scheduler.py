@@ -5,7 +5,7 @@ from array import array
 from typing import TYPE_CHECKING, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.mixin.req import DllmBatchMode, DllmReqPhase
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -47,18 +47,22 @@ class SchedulerDllmMixin:
         self._fetch_waiting_reqs()
         self.dllm_manager.init_next_round(self.tree_cache)
 
-        # Select one homogeneous phase before constructing the adder. This makes
-        # the per-round DLLM budget phase-aware.
-        is_prefill = bool(self.dllm_manager.get_prefill_requests())
+        # Select one homogeneous semantic/execution mode before constructing
+        # the adder so every downstream component consumes one source of truth.
+        dllm_batch_mode = self._get_dllm_batch_mode()
         adder = self._create_dllm_prefill_adder(
-            running_bs, running_batch=running_batch, is_prefill=is_prefill
+            running_bs,
+            running_batch=running_batch,
+            dllm_batch_mode=dllm_batch_mode,
         )
 
-        # Process batches. Pure prefill intentionally uses normal EXTEND mode:
-        # it does not contain masks and must not enter the fixed-block DLLM CUDA
-        # graph path. Decode keeps DLLM_EXTEND and its fixed block invariant.
+        # Process batches. Multi-block pure prefill uses normal EXTEND mode;
+        # single-block prefill and decode share the fixed-block DLLM_EXTEND
+        # path and its one-block-per-request invariant.
         forward_mode = self._process_dllm_batches(
-            adder, running_batch=running_batch, is_prefill=is_prefill
+            adder,
+            running_batch=running_batch,
+            dllm_batch_mode=dllm_batch_mode,
         )
 
         can_run_list = adder.can_run_list
@@ -71,7 +75,11 @@ class SchedulerDllmMixin:
 
         # Create and prepare batch
         new_batch = self._create_dllm_batch(
-            can_run_list, forward_mode, adder=adder, running_batch=running_batch
+            can_run_list,
+            forward_mode,
+            adder=adder,
+            running_batch=running_batch,
+            dllm_batch_mode=dllm_batch_mode,
         )
         return new_batch
 
@@ -208,7 +216,10 @@ class SchedulerDllmMixin:
         return False
 
     def _create_dllm_prefill_adder(
-        self: Scheduler, running_bs: int, running_batch: ScheduleBatch, is_prefill: bool
+        self: Scheduler,
+        running_bs: int,
+        running_batch: ScheduleBatch,
+        dllm_batch_mode: DllmBatchMode,
     ) -> PrefillAdder:
         """Create a prefill adder configured for DLLM scheduling."""
         return PrefillAdder(
@@ -223,17 +234,17 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             dllm_config=self.dllm_config,
-            dllm_is_prefill=is_prefill,
+            dllm_batch_mode=dllm_batch_mode,
         )
 
     def _process_dllm_batches(
         self: Scheduler,
         adder: PrefillAdder,
         running_batch: ScheduleBatch,
-        is_prefill: bool,
+        dllm_batch_mode: DllmBatchMode,
     ) -> ForwardMode:
-        """Process prefill or decode batches for DLLM."""
-        if is_prefill:
+        """Process a homogeneous dLLM batch."""
+        if dllm_batch_mode.is_prefill:
             prefill_reqs = self.dllm_manager.get_prefill_requests()
             self._process_batch_by_phase(
                 adder,
@@ -242,7 +253,11 @@ class SchedulerDllmMixin:
                 DllmReqPhase.INCOMING_PREFILL,
                 running_batch=running_batch,
             )
-            return ForwardMode.EXTEND
+            return (
+                ForwardMode.EXTEND
+                if dllm_batch_mode.is_multi_block_prefill
+                else ForwardMode.DLLM_EXTEND
+            )
         else:
             decode_reqs = self.dllm_manager.get_decode_requests()
             self._process_batch_by_phase(
@@ -254,6 +269,19 @@ class SchedulerDllmMixin:
             )
 
             return ForwardMode.DLLM_EXTEND
+
+    def _get_dllm_batch_mode(self: Scheduler) -> DllmBatchMode:
+        """Select a homogeneous dLLM batch mode.
+
+        The path is configuration-static: a single-block prefill chunk has no
+        multi-block work to batch, so it stays on the fixed-block DLLM_EXTEND
+        path instead of paying the EXTEND graph's per-round overhead.
+        """
+        if not self.dllm_manager.get_prefill_requests():
+            return DllmBatchMode.DECODE
+        if self.dllm_config.prefill_block_size == self.dllm_config.block_size:
+            return DllmBatchMode.SINGLE_BLOCK_PREFILL
+        return DllmBatchMode.MULTI_BLOCK_PREFILL
 
     def _process_batch_by_phase(
         self,
@@ -295,6 +323,7 @@ class SchedulerDllmMixin:
         forward_mode: ForwardMode,
         adder: PrefillAdder,
         running_batch: ScheduleBatch,
+        dllm_batch_mode: DllmBatchMode,
     ) -> ScheduleBatch:
         """Create and prepare a new DLLM batch."""
         new_batch = ScheduleBatch.init_new(
@@ -306,11 +335,23 @@ class SchedulerDllmMixin:
             self.enable_overlap,
             self.spec_algorithm,
             dllm_config=self.dllm_config,
-            is_dllm_prefill=forward_mode == ForwardMode.EXTEND,
+            dllm_batch_mode=dllm_batch_mode,
         )
         new_batch.prepare_for_extend()
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
+
+        if forward_mode == ForwardMode.DLLM_EXTEND:
+            # ForwardBatch.init_new overwrites DLLM_EXTEND positions with one
+            # fixed block per request, so the batch must extend by exactly one
+            # block. The adder keeps that invariant through the page-size clamp
+            # in `resolve_dllm_page_size` (page_size divides block_size, hence
+            # `_get_dllm_extend_len` aligns to block_size); assert it here so a
+            # future relaxation fails loudly instead of misaligning positions.
+            block_size = self.dllm_config.block_size
+            assert all(
+                extend_len == block_size for extend_len in new_batch.extend_lens
+            ), f"DLLM_EXTEND requires one block per request: {new_batch.extend_lens=}, {block_size=}"
 
         # Record prefill stats for logging after forward
         from sglang.srt.managers.scheduler_components.metrics_reporter import (

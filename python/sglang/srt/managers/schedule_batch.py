@@ -68,7 +68,7 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
-from sglang.srt.dllm.mixin.req import ReqDllmMixin
+from sglang.srt.dllm.mixin.req import DllmBatchMode, ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
@@ -1945,8 +1945,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
-    # True only when the dLLM scheduler selected the pure-prefill phase.
-    is_dllm_prefill: bool = False
+    # Semantic phase and execution path of this homogeneous dLLM batch.
+    dllm_batch_mode: Optional[DllmBatchMode] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -1992,8 +1992,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         spec_algorithm: SpeculativeAlgorithm,
         chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
-        is_dllm_prefill: bool = False,
+        dllm_batch_mode: Optional[DllmBatchMode] = None,
     ):
+        if dllm_config is not None and dllm_batch_mode is None:
+            raise ValueError("dllm_batch_mode is required when dllm_config is set")
         return_logprob = any(req.return_logprob for req in reqs)
 
         batch = cls(
@@ -2015,9 +2017,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 model_config.vocab_size,
             ),
             dllm_config=dllm_config,
-            is_dllm_prefill=is_dllm_prefill,
+            dllm_batch_mode=dllm_batch_mode,
         )
         return batch
+
+    @property
+    def is_dllm_prefill(self) -> bool:
+        return self.dllm_batch_mode is not None and self.dllm_batch_mode.is_prefill
 
     def batch_size(self):
         return len(self.reqs)
@@ -3035,6 +3041,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            # process_batch_result_dllm branches on the batch mode.
+            dllm_config=self.dllm_config,
+            dllm_batch_mode=self.dllm_batch_mode,
         )
 
     def maybe_evict_swa(self):

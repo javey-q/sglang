@@ -17,6 +17,29 @@ class DllmReqPhase(str, enum.Enum):
     INCOMING_DECODE = "incoming_decode"
 
 
+class DllmBatchMode(str, enum.Enum):
+    """Semantic phase and execution path of a homogeneous dLLM batch.
+
+    Decode has a single execution path, so the three members cover every
+    reachable (phase, path) pair and make the mixed batch unrepresentable.
+    """
+
+    DECODE = "decode"
+    SINGLE_BLOCK_PREFILL = "single_block_prefill"
+    MULTI_BLOCK_PREFILL = "multi_block_prefill"
+
+    @property
+    def is_prefill(self) -> bool:
+        return self in (
+            DllmBatchMode.SINGLE_BLOCK_PREFILL,
+            DllmBatchMode.MULTI_BLOCK_PREFILL,
+        )
+
+    @property
+    def is_multi_block_prefill(self) -> bool:
+        return self == DllmBatchMode.MULTI_BLOCK_PREFILL
+
+
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
         self.dllm_phase: Optional[DllmReqPhase] = None

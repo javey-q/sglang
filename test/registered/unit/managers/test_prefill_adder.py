@@ -1,13 +1,14 @@
 import unittest
 from array import array
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.dllm.config import (
     DllmConfig,
     _validate_multi_block_prefill_backend,
 )
-from sglang.srt.dllm.mixin.req import DllmReqPhase, ReqDllmMixin
+from sglang.srt.dllm.mixin.req import DllmBatchMode, DllmReqPhase, ReqDllmMixin
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -142,6 +143,7 @@ class TestPrefillAdder(CustomTestCase):
         is_prefill: bool,
         rem_input_tokens: int = 10000,
         available_size: int = 10000,
+        batch_mode: Optional[DllmBatchMode] = None,
     ):
         self.mock_token_allocator.available_size.return_value = available_size
         dllm_config = SimpleNamespace(
@@ -149,12 +151,18 @@ class TestPrefillAdder(CustomTestCase):
             prefill_block_size=128,
             max_running_requests=2,
         )
+        if batch_mode is None:
+            batch_mode = (
+                DllmBatchMode.MULTI_BLOCK_PREFILL
+                if is_prefill
+                else DllmBatchMode.DECODE
+            )
         return self.create_adder(
             self.create_running_batch(),
             page_size=32,
             rem_input_tokens=rem_input_tokens,
             dllm_config=dllm_config,
-            dllm_is_prefill=is_prefill,
+            dllm_batch_mode=batch_mode,
         )
 
     def test_dllm_multi_block_prefill_requires_flashinfer(self):
@@ -176,58 +184,59 @@ class TestPrefillAdder(CustomTestCase):
                 prefill_attention_backend="triton",
             )
 
-    def test_dllm_prefill_block_size_cli_override(self):
-        server_args = SimpleNamespace(
+    def create_dllm_server_args(self, **kwargs) -> SimpleNamespace:
+        defaults = dict(
             dllm_algorithm="LowConfidence",
             model_path="dummy",
             revision=None,
             max_running_requests=2,
             max_prefill_tokens=16384,
             dllm_algorithm_config=None,
-            dllm_prefill_block_size=128,
+            dllm_prefill_block_size=None,
             dllm_fdfo=True,
             attention_backend=None,
             prefill_attention_backend=None,
             decode_attention_backend=None,
         )
+        defaults.update(kwargs)
+        return SimpleNamespace(**defaults)
+
+    def build_dllm_config(self, server_args: SimpleNamespace) -> DllmConfig:
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LLaDA2MoeModelLM"])
         )
-
         with patch(
             "sglang.srt.dllm.config.ModelConfig.from_server_args",
             return_value=model_config,
         ):
-            config = DllmConfig.from_server_args(server_args)
+            return DllmConfig.from_server_args(server_args)
+
+    def test_dllm_prefill_block_size_cli_override(self):
+        config = self.build_dllm_config(
+            self.create_dllm_server_args(dllm_prefill_block_size=128)
+        )
 
         self.assertEqual(config.prefill_block_size, 128)
 
+    def test_dllm_prefill_block_size_defaults_to_one_block(self):
+        """The default keeps single-block prefill on the DLLM_EXTEND path.
+
+        Multi-block prefill is opt-in: defaulting it on would also require the
+        FlashInfer prefill backend, which AMD (triton/aiter) and NPU (ascend)
+        dLLM deployments do not have.
+        """
+        # block_size is 32 for LLaDA2MoeModelLM.
+        config = self.build_dllm_config(self.create_dllm_server_args())
+
+        self.assertEqual(config.prefill_block_size, 32)
+
     def test_dllm_max_prefill_tokens_must_fit_one_block(self):
-        server_args = SimpleNamespace(
-            dllm_algorithm="LowConfidence",
-            model_path="dummy",
-            revision=None,
-            max_running_requests=2,
-            max_prefill_tokens=16,
-            dllm_algorithm_config=None,
-            dllm_prefill_block_size=None,
-            dllm_fdfo=True,
-            attention_backend="flashinfer",
-            prefill_attention_backend=None,
-            decode_attention_backend=None,
-        )
-        model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["LLaDA2MoeModelLM"])
+        server_args = self.create_dllm_server_args(
+            max_prefill_tokens=16, attention_backend="flashinfer"
         )
 
-        with patch(
-            "sglang.srt.dllm.config.ModelConfig.from_server_args",
-            return_value=model_config,
-        ):
-            with self.assertRaisesRegex(
-                ValueError, "max_prefill_tokens must be at least"
-            ):
-                DllmConfig.from_server_args(server_args)
+        with self.assertRaisesRegex(ValueError, "max_prefill_tokens must be at least"):
+            self.build_dllm_config(server_args)
 
     def test_dllm_prefill_uses_phase_budget_and_block_aligned_context(self):
         adder = self.create_dllm_adder(is_prefill=True)
@@ -306,8 +315,13 @@ class TestPrefillAdder(CustomTestCase):
             tree_cache=MagicMock(),
             _should_skip_prefill=lambda *, running_batch: False,
             _fetch_waiting_reqs=lambda: None,
+            dllm_config=SimpleNamespace(block_size=32, prefill_block_size=256),
             _create_dllm_prefill_adder=MagicMock(),
             _process_dllm_batches=MagicMock(return_value=ForwardMode.DLLM_EXTEND),
+        )
+        # The real selector runs: it is what observes the post-init phase.
+        scheduler._get_dllm_batch_mode = (
+            lambda: SchedulerDllmMixin._get_dllm_batch_mode(scheduler)
         )
         adder = SimpleNamespace(can_run_list=[req])
         scheduler._create_dllm_prefill_adder.return_value = adder
@@ -319,8 +333,53 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNotNone(batch)
         manager.init_next_round.assert_called_once_with(scheduler.tree_cache)
         scheduler._process_dllm_batches.assert_called_once_with(
-            adder, running_batch=running_batch, is_prefill=False
+            adder,
+            running_batch=running_batch,
+            dllm_batch_mode=DllmBatchMode.DECODE,
         )
+
+    def test_dllm_batch_mode_selection(self):
+        """Path selection is config-static and prefill-request driven.
+
+        A wrong DECODE branch would send a decode round down the EXTEND graph;
+        a wrong prefill branch would put single-block prefill on the prefill
+        CUDA graph (or strand multi-block prefill on DLLM_EXTEND, whose fixed
+        one-block positions cannot describe it).
+        """
+        for prefill_reqs, prefill_block_size, expected in (
+            ([], 256, DllmBatchMode.DECODE),
+            ([], 32, DllmBatchMode.DECODE),
+            ([MagicMock()], 32, DllmBatchMode.SINGLE_BLOCK_PREFILL),
+            ([MagicMock()], 256, DllmBatchMode.MULTI_BLOCK_PREFILL),
+        ):
+            scheduler = SimpleNamespace(
+                dllm_manager=MagicMock(),
+                dllm_config=SimpleNamespace(
+                    block_size=32, prefill_block_size=prefill_block_size
+                ),
+            )
+            scheduler.dllm_manager.get_prefill_requests.return_value = prefill_reqs
+
+            self.assertEqual(
+                SchedulerDllmMixin._get_dllm_batch_mode(scheduler),
+                expected,
+                msg=f"{prefill_reqs=}, {prefill_block_size=}",
+            )
+
+    def test_dllm_single_block_prefill_budget_is_one_block(self):
+        """Single-block prefill must extend by exactly one block per request.
+
+        ForwardBatch.init_new overwrites DLLM_EXTEND positions with one fixed
+        block per request, so any other chunk length silently misaligns
+        positions against input_ids.
+        """
+        adder = self.create_dllm_adder(
+            is_prefill=True, batch_mode=DllmBatchMode.SINGLE_BLOCK_PREFILL
+        )
+        self.assertEqual(adder.dllm_prefill_block_size, 32)
+
+        req = self.create_dllm_req(origin_len=256, prefix_len=0, is_prefill=True)
+        self.assertEqual(adder._get_dllm_extend_len(req, prefix_len=0), 32)
 
     def test_dllm_manager_prepares_incoming_req_before_phase_selection(self):
         req = MagicMock()
@@ -401,32 +460,34 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         scheduler._abort_dllm_req_exact.assert_called_once_with(req)
 
-    def test_dllm_scheduler_uses_normal_extend_only_for_prefill(self):
+    def test_dllm_scheduler_uses_normal_extend_only_for_multi_block_prefill(self):
+        """Only multi-block prefill leaves the fixed-block DLLM_EXTEND path.
+
+        Single-block prefill shares decode's one-block-per-request shape, so it
+        must keep DLLM_EXTEND (and its decode graph) rather than pay the EXTEND
+        path's per-round overhead.
+        """
         scheduler = SimpleNamespace(
             dllm_manager=MagicMock(), _process_batch_by_phase=MagicMock()
         )
         running_batch = MagicMock()
         scheduler.dllm_manager.get_prefill_requests.return_value = [MagicMock()]
 
-        self.assertEqual(
-            SchedulerDllmMixin._process_dllm_batches(
-                scheduler,
-                MagicMock(),
-                running_batch=running_batch,
-                is_prefill=True,
-            ),
-            ForwardMode.EXTEND,
-        )
-
-        self.assertEqual(
-            SchedulerDllmMixin._process_dllm_batches(
-                scheduler,
-                MagicMock(),
-                running_batch=running_batch,
-                is_prefill=False,
-            ),
-            ForwardMode.DLLM_EXTEND,
-        )
+        for dllm_batch_mode, expected in (
+            (DllmBatchMode.MULTI_BLOCK_PREFILL, ForwardMode.EXTEND),
+            (DllmBatchMode.SINGLE_BLOCK_PREFILL, ForwardMode.DLLM_EXTEND),
+            (DllmBatchMode.DECODE, ForwardMode.DLLM_EXTEND),
+        ):
+            self.assertEqual(
+                SchedulerDllmMixin._process_dllm_batches(
+                    scheduler,
+                    MagicMock(),
+                    running_batch=running_batch,
+                    dllm_batch_mode=dllm_batch_mode,
+                ),
+                expected,
+                msg=str(dllm_batch_mode),
+            )
 
     def test_dllm_scheduler_propagates_explicit_prefill_phase(self):
         scheduler = SimpleNamespace(
@@ -436,7 +497,7 @@ class TestPrefillAdder(CustomTestCase):
             model_config=object(),
             enable_overlap=False,
             spec_algorithm=object(),
-            dllm_config=object(),
+            dllm_config=SimpleNamespace(block_size=32),
             adder=MagicMock(),
             running_batch=SimpleNamespace(reqs=[]),
             enable_priority_scheduling=False,
@@ -444,10 +505,11 @@ class TestPrefillAdder(CustomTestCase):
         module = "sglang.srt.dllm.mixin.scheduler"
 
         for forward_mode, expected in (
-            (ForwardMode.EXTEND, True),
-            (ForwardMode.DLLM_EXTEND, False),
+            (ForwardMode.EXTEND, DllmBatchMode.MULTI_BLOCK_PREFILL),
+            (ForwardMode.DLLM_EXTEND, DllmBatchMode.DECODE),
         ):
             batch = MagicMock()
+            batch.extend_lens = [32]
             with (
                 patch(f"{module}.ScheduleBatch.init_new", return_value=batch) as init,
                 patch(
@@ -462,10 +524,11 @@ class TestPrefillAdder(CustomTestCase):
                     forward_mode,
                     scheduler.adder,
                     scheduler.running_batch,
+                    dllm_batch_mode=expected,
                 )
 
             self.assertIs(result, batch)
-            self.assertEqual(init.call_args.kwargs["is_dllm_prefill"], expected)
+            self.assertEqual(init.call_args.kwargs["dllm_batch_mode"], expected)
             self.assertEqual(batch.forward_mode, forward_mode)
 
     def test_dllm_prefill_worker_bypasses_denoising_algorithm(self):
@@ -549,7 +612,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         forward_batch = SimpleNamespace(
             dllm_config=SimpleNamespace(),
-            is_dllm_prefill=True,
+            is_dllm_multi_block_prefill=True,
             forward_mode=ForwardMode.EXTEND,
             input_ids=[1] * 32,
             input_embeds=None,
@@ -576,11 +639,12 @@ class TestPrefillAdder(CustomTestCase):
             )
             forward_batch.forward_mode = ForwardMode.EXTEND
 
-            forward_batch.is_dllm_prefill = False
+            # Decode and single-block prefill keep the decode graph.
+            forward_batch.is_dllm_multi_block_prefill = False
             self.assertFalse(
                 PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
             )
-            forward_batch.is_dllm_prefill = True
+            forward_batch.is_dllm_multi_block_prefill = True
 
             forward_batch.input_ids = [1] * 31
             self.assertFalse(

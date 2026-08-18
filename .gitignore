@@ -286,3 +286,5 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+benchmark_results/

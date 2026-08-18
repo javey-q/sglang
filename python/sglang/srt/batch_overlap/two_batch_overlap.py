@@ -736,7 +736,7 @@ class TboForwardBatchPreparer:
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
             "dllm_config",  # shared forward-level dLLM config
-            "is_dllm_prefill",  # inherited forward-level dLLM phase flag
+            "dllm_batch_mode",  # inherited dLLM batch mode
         ]:
             output_dict[key] = getattr(batch, key)
 

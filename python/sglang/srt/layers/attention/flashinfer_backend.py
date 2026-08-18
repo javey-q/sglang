@@ -994,7 +994,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
             self_attention_custom_mask = None
-            if forward_batch.is_dllm_prefill:
+            # Single-block prefill never crosses a block boundary, so plain
+            # non-causal attention already has the desired visibility.
+            if forward_batch.is_dllm_multi_block_prefill:
                 assert forward_batch.dllm_config is not None
                 prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
                 extend_lens_cpu = forward_batch.extend_seq_lens_cpu

@@ -61,6 +61,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.dllm.mixin.req import DllmBatchMode
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.layers.utils.cp_utils import ContextParallelMetadata
@@ -452,9 +453,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-    # Diffusion LLM config and scheduler-selected pure-prefill phase.
+    # Diffusion LLM config and the scheduler-selected homogeneous batch mode.
     dllm_config: Optional[object] = None
-    is_dllm_prefill: bool = False
+    dllm_batch_mode: Optional[DllmBatchMode] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -738,7 +739,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
             dllm_config=batch.dllm_config,
-            is_dllm_prefill=batch.is_dllm_prefill,
+            dllm_batch_mode=batch.dllm_batch_mode,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -907,6 +908,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         return ret
+
+    @property
+    def is_dllm_prefill(self) -> bool:
+        """Semantic phase: this batch only commits prompt KV."""
+        return self.dllm_batch_mode is not None and self.dllm_batch_mode.is_prefill
+
+    @property
+    def is_dllm_multi_block_prefill(self) -> bool:
+        """Execution path: EXTEND + blockwise prefill mask + prefill graph."""
+        return (
+            self.dllm_batch_mode is not None
+            and self.dllm_batch_mode.is_multi_block_prefill
+        )
 
     def _maybe_init_non_generation_fields(self, batch: ScheduleBatch):
         """Derive non-generation (max_new_tokens==0) forward fields from reqs.

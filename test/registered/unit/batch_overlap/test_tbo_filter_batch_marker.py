@@ -13,6 +13,7 @@ import torch
 
 import sglang.srt.batch_overlap.two_batch_overlap as tbo
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.dllm.mixin.req import DllmBatchMode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -59,20 +60,24 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertIsNone(child.forward_metadata_planned_bs)
         self.assertIsNone(child.forward_metadata_planned_num_tokens)
         self.assertFalse(child.forward_metadata_replan_equivalent)
-        # A default ``False`` is still a valued dataclass field and must be
+        # A default ``None`` is still a valued dataclass field and must be
         # explicitly propagated through TBO filtering.
+        self.assertIsNone(child.dllm_batch_mode)
         self.assertFalse(child.is_dllm_prefill)
 
     def test_dllm_fields_are_propagated_to_children(self):
         parent = _make_target_verify_batch(8)
         dllm_config = object()
         parent.dllm_config = dllm_config
-        parent.is_dllm_prefill = True
+        parent.dllm_batch_mode = DllmBatchMode.MULTI_BLOCK_PREFILL
 
         child = _filter(parent, lo=0, hi=4)
 
         self.assertIs(child.dllm_config, dllm_config)
+        self.assertEqual(child.dllm_batch_mode, DllmBatchMode.MULTI_BLOCK_PREFILL)
+        # The derived phase/path properties follow the propagated mode.
         self.assertTrue(child.is_dllm_prefill)
+        self.assertTrue(child.is_dllm_multi_block_prefill)
 
     def test_pre_planned_parent_does_not_leak_ready_into_children(self):
         parent = _make_target_verify_batch(8)
