@@ -365,4 +365,3 @@ max_concurrency    = 1, 4, 16
 - BCG graph miss 为 0 的 case 不应再出现明显的 main 对比回归。
 
 最重要的诊断原则：不能只看 CUDA graph hit/miss。当前 pbs32 已经 graph hit，但仍然慢，说明主要问题是每轮 replay 的固定路径成本，而不是 graph 未命中。
-

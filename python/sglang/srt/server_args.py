@@ -4266,7 +4266,12 @@ class ServerArgs:
         """
         if self.dllm_algorithm is None:
             return None
-        if self.cuda_graph_config.prefill.backend != Backend.BREAKABLE:
+        # Both graph backends that can run multi-block prefill need exact
+        # buckets; tc_piecewise / disabled keep the generic schedule.
+        if self.cuda_graph_config.prefill.backend not in (
+            Backend.BREAKABLE,
+            Backend.FULL,
+        ):
             return None
 
         from sglang.srt.arg_groups.overrides import (

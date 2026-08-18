@@ -23,7 +23,12 @@ from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
 )
-from sglang.srt.dllm.attention import build_dllm_prefill_blockwise_mask
+from sglang.srt.dllm.attention import (
+    build_dllm_prefill_blockwise_mask,
+    build_dllm_prefill_cuda_graph_mask,
+    build_dllm_prefill_packed_mask,
+    dllm_prefill_packed_mask_indptr,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -545,6 +550,12 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+        # dLLM multi-block prefill under full prefill CUDA graph: the ragged
+        # current-chunk half of the cascade, carrying the blockwise mask. The
+        # paged half reuses full_cg_prefill_wrappers above.
+        self.full_cg_dllm_ragged_wrapper: Optional[
+            BatchPrefillWithRaggedKVCacheWrapper
+        ] = None
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -744,7 +755,13 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+            self._prepare_cuda_graph_metadata(
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                is_dllm_multi_block_prefill=forward_batch.is_dllm_multi_block_prefill,
+            )
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -794,6 +811,51 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
             )
+        elif forward_mode.is_extend() and forward_batch.is_dllm_multi_block_prefill:
+            # dLLM multi-block prefill under full prefill CUDA graph. The
+            # ragged wrapper covers the current chunk and carries the
+            # blockwise mask; the paged wrapper covers the committed prefix
+            # (fully visible, no mask); forward_extend merges the two. Both
+            # keep capture-stable buffers, so plan() here refreshes what the
+            # captured kernels read. Must stay above the plain-EXTEND branch.
+            device = forward_batch.input_ids.device
+            prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            block_size = forward_batch.dllm_config.block_size
+            # Prefer the directly-packed mask: it skips both the O(q x k) bool
+            # tensor and plan()'s segment_packbits. Falls back to the bool mask
+            # for chunk lengths that are not byte-aligned.
+            packed_mask = build_dllm_prefill_packed_mask(
+                prefix_lens_cpu, extend_lens_cpu, block_size, device
+            )
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                seq_lens_sum,
+                prefix_lens=forward_batch.extend_prefix_lens[:bs],
+                prefill_wrappers=self.full_cg_prefill_wrappers,
+                use_ragged=True,
+                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                spec_info=None,
+                self_attention_custom_mask=(
+                    None
+                    if packed_mask is not None
+                    else build_dllm_prefill_cuda_graph_mask(
+                        prefix_lens_cpu, extend_lens_cpu, block_size, device
+                    )
+                ),
+                self_attention_packed_mask=packed_mask,
+                extend_prefix_lens_cpu=prefix_lens_cpu,
+                ragged_wrapper=self.full_cg_dllm_ragged_wrapper,
+            )
+            if packed_mask is not None:
+                # plan() stored bit offsets for the pre-packed mask; the kernel
+                # reads byte offsets. We own this buffer (passed as
+                # mask_indptr_buf at construction), so correct it in place.
+                self.full_cg_dllm_mask_indptr.copy_(
+                    dllm_prefill_packed_mask_indptr(extend_lens_cpu, device)
+                )
         elif forward_mode.is_extend():
             # Plain EXTEND under full prefill CUDA graph. plan() runs
             # out-of-graph against capture-stable wrappers; captured kernels
@@ -1274,12 +1336,79 @@ class FlashInferAttnBackend(AttentionBackend):
             for i in range(self.num_wrappers)
         ]
 
+    def _create_full_cg_dllm_ragged_wrapper(
+        self, num_slots: int, max_num_tokens: int
+    ) -> BatchPrefillWithRaggedKVCacheWrapper:
+        """Ragged wrapper for dLLM multi-block prefill captured under a full
+        prefill CUDA graph.
+
+        Unlike ``prefill_wrapper_ragged`` (eager / BCG, where attention runs
+        outside the graph), every buffer this wrapper reads must live at a
+        capture-stable address: the blockwise mask changes size *and* content
+        between replays, so plan() has to write it into a static
+        ``custom_mask_buf`` rather than allocate a fresh packed tensor.
+
+        Sizing follows the same rules the paged full-CG wrappers already
+        obey: ``_fixed_batch_size`` and ``_max_total_num_rows`` latch on the
+        first plan, so the request-slot count is fixed at capture and the
+        largest bucket must be captured first. The packed mask worst case is
+        one request owning the whole bucket.
+        """
+        device = self.workspace_buffer.device
+        upd = self.indices_updater_prefill
+        workspace_bytes = self._full_cg_prefill_workspace_bytes(
+            num_slots,
+            max_num_tokens,
+            num_qo_heads=upd.num_qo_heads,
+            num_kv_heads=upd.num_kv_heads,
+            head_dim=upd.head_dim,
+            device=device,
+        )
+        mask_bytes = (max_num_tokens * max_num_tokens + 7) // 8
+        logger.info(
+            "Full-CG dLLM ragged prefill: workspace %.0f MB, packed mask %.1f MB "
+            "(max bucket %d tokens, %d request slots)",
+            workspace_bytes / (1024 * 1024),
+            mask_bytes / (1024 * 1024),
+            max_num_tokens,
+            num_slots,
+        )
+        self.full_cg_dllm_ragged_workspace_buffer = torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        )
+        self.full_cg_dllm_qo_indptr = torch.zeros(
+            (num_slots + 1,), dtype=torch.int32, device=device
+        )
+        self.full_cg_dllm_kv_indptr = torch.zeros(
+            (num_slots + 1,), dtype=torch.int32, device=device
+        )
+        self.full_cg_dllm_mask_indptr = torch.zeros(
+            (num_slots + 1,), dtype=torch.int32, device=device
+        )
+        self.full_cg_dllm_custom_mask = torch.zeros(
+            (mask_bytes,), dtype=torch.uint8, device=device
+        )
+        return BatchPrefillWithRaggedKVCacheWrapper(
+            self.full_cg_dllm_ragged_workspace_buffer,
+            "NHD",
+            use_cuda_graph=True,
+            # Pin fa2: backend="auto" resolves on the first plan and sticks,
+            # and only fa2 supports a custom mask (same reason
+            # prefill_wrapper_ragged_custom_mask exists).
+            backend="fa2",
+            qo_indptr_buf=self.full_cg_dllm_qo_indptr,
+            kv_indptr_buf=self.full_cg_dllm_kv_indptr,
+            custom_mask_buf=self.full_cg_dllm_custom_mask,
+            mask_indptr_buf=self.full_cg_dllm_mask_indptr,
+        )
+
     def _prepare_cuda_graph_metadata(
         self,
         bs: int,
         num_tokens: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        is_dllm_multi_block_prefill: bool = False,
     ) -> None:
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
@@ -1306,8 +1435,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 self.full_cg_prefill_wrappers = self._create_full_cg_prefill_wrappers(
                     bs, num_tokens
                 )
+            if not is_dllm_multi_block_prefill:
+                self.forward_metadata = PrefillMetadata(
+                    self.full_cg_prefill_wrappers, False, False
+                )
+                return
+            if self.full_cg_dllm_ragged_wrapper is None:
+                self.full_cg_dllm_ragged_wrapper = (
+                    self._create_full_cg_dllm_ragged_wrapper(bs, num_tokens)
+                )
+            # extend_no_prefix is a Python-level branch in forward_extend that
+            # the capture bakes in, so the cascade (ragged chunk + paged prefix
+            # + merge_state) is always the captured shape. can_run_graph keeps
+            # prefix-free batches off this graph.
             self.forward_metadata = PrefillMetadata(
-                self.full_cg_prefill_wrappers, False, False
+                self.full_cg_prefill_wrappers,
+                True,
+                False,
+                ragged_wrapper=self.full_cg_dllm_ragged_wrapper,
             )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -1867,6 +2012,8 @@ class FlashInferIndicesUpdaterPrefill:
         self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
+        self_attention_packed_mask: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1888,6 +2035,8 @@ class FlashInferIndicesUpdaterPrefill:
         self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
+        self_attention_packed_mask: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             assert prefix_lens is not None
@@ -1919,6 +2068,8 @@ class FlashInferIndicesUpdaterPrefill:
             self_attention_custom_mask=self_attention_custom_mask,
             seq_lens_cpu=seq_lens_cpu,
             custom_kv_indices=custom_kv_indices,
+            ragged_wrapper=ragged_wrapper,
+            self_attention_packed_mask=self_attention_packed_mask,
         )
 
     def update_sliding_window(
@@ -1938,10 +2089,17 @@ class FlashInferIndicesUpdaterPrefill:
         self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
+        self_attention_packed_mask: Optional[torch.Tensor] = None,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
+            )
+        if ragged_wrapper is not None or self_attention_packed_mask is not None:
+            raise RuntimeError(
+                "An explicit ragged wrapper / pre-packed mask (full-CG dLLM prefill) "
+                "is only supported by the single-wrapper FlashInfer path."
             )
         if prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
@@ -2074,10 +2232,17 @@ class FlashInferIndicesUpdaterPrefill:
         self_attention_custom_mask: Optional[torch.Tensor] = None,
         extend_prefix_lens_cpu: Optional[List[int]] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
+        ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
+        self_attention_packed_mask: Optional[torch.Tensor] = None,
     ):
         if custom_kv_indices is not None:
             raise RuntimeError(
                 "NVFP4 custom KV indices are not supported for cross-attention."
+            )
+        if ragged_wrapper is not None or self_attention_packed_mask is not None:
+            raise RuntimeError(
+                "An explicit ragged wrapper / pre-packed mask (full-CG dLLM prefill) "
+                "is not supported for cross-attention."
             )
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -2136,9 +2301,18 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens_cpu: Optional[torch.Tensor] = None,
         custom_kv_indices: Optional[torch.Tensor] = None,
         window_left: int = -1,
+        ragged_wrapper: Optional[BatchPrefillWithRaggedKVCacheWrapper] = None,
+        self_attention_packed_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
-        if use_ragged and self_attention_custom_mask is not None:
+        if ragged_wrapper is not None:
+            # Explicit override: the full-CG dLLM path owns a cuda-graph ragged
+            # wrapper whose static buffers the captured kernels read.
+            wrapper_ragged = ragged_wrapper
+        elif use_ragged and (
+            self_attention_custom_mask is not None
+            or self_attention_packed_mask is not None
+        ):
             wrapper_ragged = self.prefill_wrapper_ragged_custom_mask
         if spec_info is None:
             assert prefix_lens is not None
@@ -2214,6 +2388,7 @@ class FlashInferIndicesUpdaterPrefill:
                 self.head_dim,
                 q_data_type=self.q_data_type,
                 custom_mask=self_attention_custom_mask,
+                packed_custom_mask=self_attention_packed_mask,
             )
 
         if use_sliding_window_kv_pool:

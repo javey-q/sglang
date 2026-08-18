@@ -3,7 +3,12 @@ from math import log, sqrt
 
 import torch
 
-from sglang.srt.dllm.attention import build_dllm_prefill_blockwise_mask
+from sglang.srt.dllm.attention import (
+    build_dllm_prefill_blockwise_mask,
+    build_dllm_prefill_cuda_graph_mask,
+    build_dllm_prefill_packed_mask,
+    dllm_prefill_packed_mask_indptr,
+)
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -196,6 +201,98 @@ class TestDllmPrefillBlockwiseMask(unittest.TestCase):
         )
         expected = torch.tensor([[1, 0], [1, 1]], dtype=torch.bool)
         torch.testing.assert_close(mask.view(2, 2), expected)
+
+    def test_cuda_graph_mask_never_none_for_single_block_chunks(self):
+        """A captured ragged wrapper owns a static custom_mask_buf, and
+        FlashInfer picks its mask mode from that buffer's existence rather than
+        from the mask argument. Planning a replay with None therefore does not
+        degrade to non-causal attention -- it leaves whatever the buffer held
+        from the previous replay in force, silently corrupting output. The
+        cuda-graph builder must always hand back a real mask.
+        """
+        lens = ([0, 8], [2, 1])
+        self.assertIsNone(
+            build_dllm_prefill_blockwise_mask(
+                *lens, 2, torch.device("cpu"), include_prefix=False
+            )
+        )
+        mask = build_dllm_prefill_cuda_graph_mask(*lens, 2, torch.device("cpu"))
+        self.assertEqual(mask.numel(), 2 * 2 + 1 * 1)
+        self.assertTrue(mask.all())
+
+    def test_cuda_graph_mask_ignores_sentinel_slots(self):
+        """Full CG always plans req_slots entries, padding the tail with
+        zero-length sentinels. Those slots must contribute an empty mask
+        segment: FlashInfer's mask_indptr_buf.copy_() needs exactly
+        req_slots + 1 entries, so a sentinel that produced elements would both
+        corrupt the offsets and overflow the packed buffer.
+        """
+        real = build_dllm_prefill_cuda_graph_mask(
+            [0, 4], [2, 4], 2, torch.device("cpu")
+        )
+        padded = build_dllm_prefill_cuda_graph_mask(
+            [0, 4, 0, 0], [2, 4, 0, 0], 2, torch.device("cpu")
+        )
+        torch.testing.assert_close(padded, real)
+
+    def test_packed_mask_matches_bitpacked_bool_mask(self):
+        """The packed builder must reproduce, byte for byte, what packing the
+        bool mask would have produced -- it replaces that path entirely, and a
+        mismatch is silently wrong attention rather than a crash.
+
+        Layout is little-endian per byte, segments concatenated in request
+        order, matching FlashInfer's segment_packbits(bitorder="little").
+        """
+        cpu = torch.device("cpu")
+        for prefix_lens, extend_lens, block_size in (
+            ([0], [64], 32),
+            ([2048], [64], 32),
+            ([2064], [64], 32),  # unaligned prefix: r != 0
+            ([0, 4096], [32, 64], 32),
+            ([96], [24], 8),
+            ([0, 0], [64, 0], 32),  # zero-length sentinel contributes nothing
+        ):
+            packed = build_dllm_prefill_packed_mask(
+                prefix_lens, extend_lens, block_size, cpu
+            )
+            reference = build_dllm_prefill_cuda_graph_mask(
+                prefix_lens, extend_lens, block_size, cpu
+            )
+            # Pack the reference the way FlashInfer does: each row of each
+            # segment is byte-aligned because extend_len % 8 == 0.
+            expected = torch.zeros(reference.numel() // 8, dtype=torch.uint8)
+            bits = reference.view(-1, 8).to(torch.uint8)
+            for bit in range(8):
+                expected |= bits[:, bit] << bit
+            torch.testing.assert_close(packed, expected)
+
+    def test_packed_mask_declines_non_byte_aligned_chunks(self):
+        """Rows are byte-aligned only when extend_len % 8 == 0. For anything
+        else the packed layout the kernel indexes cannot be built row-wise, so
+        the builder must decline and let the caller fall back to the bool mask
+        rather than emit a subtly misaligned buffer.
+        """
+        cpu = torch.device("cpu")
+        self.assertIsNone(
+            build_dllm_prefill_packed_mask([0], [12], 4, cpu)
+        )
+        self.assertIsNotNone(
+            build_dllm_prefill_packed_mask([0], [16], 4, cpu)
+        )
+
+    def test_packed_mask_indptr_is_in_bytes(self):
+        """FlashInfer's kernel indexes custom_mask by byte, but
+        plan(packed_custom_mask=...) stores _compute_mask_indptr, which is in
+        bits. This helper supplies the byte offsets callers overwrite it with;
+        if it ever drifts back to bit units, every request after the first
+        reads 8x past its own segment.
+        """
+        indptr = dllm_prefill_packed_mask_indptr([64, 32, 0], torch.device("cpu"))
+        self.assertEqual(indptr.tolist(), [0, 64 * 64 // 8, 64 * 64 // 8 + 32 * 32 // 8, 64 * 64 // 8 + 32 * 32 // 8])
+        packed = build_dllm_prefill_packed_mask(
+            [0, 0, 0], [64, 32, 0], 32, torch.device("cpu")
+        )
+        self.assertEqual(int(indptr[-1]), packed.numel())
 
     def test_invalid_lengths(self):
         with self.assertRaisesRegex(ValueError, "same length"):

@@ -288,6 +288,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # default False; the assignment below sets the real value once the
         # backend type is known.
         self._is_full_backend = False
+        # Same rationale again: capture_prepare reads these before the backend
+        # is known. Only Full CG captures attention itself, so only it needs a
+        # dLLM-shaped capture dummy.
+        self._capture_dllm_multi_block_prefill = False
+        self._capture_dllm_prefix_len = 0
+        self._capture_dllm_batch_mode = None
+        self._capture_dllm_config = None
         try:
             self.backend = resolve_prefill_backend(self)
         except RuntimeError as e:
@@ -306,6 +313,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # Auto: scale request slots with the chunked prefill size.
                 max_req = max(model_runner.server_args.chunked_prefill_size // 512, 1)
             self._capture_req_slots = min(max_req, self.max_bs)
+            self._init_dllm_capture_shape(model_runner)
         self._full_cg_seq_lens_cpu = (
             torch.zeros((self._capture_req_slots,), dtype=torch.int64, device="cpu")
             if self._is_full_backend
@@ -385,6 +393,27 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
+
+    def _init_dllm_capture_shape(self, model_runner: ModelRunner) -> None:
+        """Decide whether Full CG should capture a dLLM multi-block prefill.
+
+        Only reachable with backend == full: BCG runs attention outside the
+        graph, so its capture dummy never needs a dLLM shape. The config is
+        frozen for the runner's lifetime, so resolve it once here.
+        """
+        from sglang.srt.dllm.config import DllmConfig
+        from sglang.srt.dllm.mixin.req import DllmBatchMode
+
+        dllm_config = DllmConfig.from_server_args(model_runner.server_args)
+        if dllm_config is None:
+            return
+        if dllm_config.prefill_block_size <= dllm_config.block_size:
+            # Single-block prefill stays on DLLM_EXTEND and the decode graph.
+            return
+        self._capture_dllm_multi_block_prefill = True
+        self._capture_dllm_prefix_len = dllm_config.block_size
+        self._capture_dllm_batch_mode = DllmBatchMode.MULTI_BLOCK_PREFILL
+        self._capture_dllm_config = dllm_config
 
     def _is_mamba_track_enabled(self) -> bool:
         return (
@@ -685,6 +714,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.req_pool_indices = s["req_pool_indices"][:r]
             padded_view.extend_seq_lens = s["extend_seq_lens"][:r]
             padded_view.extend_prefix_lens = s["extend_prefix_lens"][:r]
+            if forward_batch.is_dllm_multi_block_prefill:
+                # The blockwise mask is built per request from host lengths, so
+                # the CPU lists need the same sentinel padding as the tensors —
+                # zero-length slots contribute an empty mask segment, which is
+                # what keeps mask_indptr's length equal to req_slots + 1.
+                pad = [0] * (r - bs)
+                padded_view.extend_seq_lens_cpu = (
+                    list(forward_batch.extend_seq_lens_cpu) + pad
+                )
+                padded_view.extend_prefix_lens_cpu = (
+                    list(forward_batch.extend_prefix_lens_cpu) + pad
+                )
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
@@ -713,6 +754,29 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    def _can_run_full_dllm_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Extra admission rules for dLLM multi-block prefill under Full CG.
+
+        Full CG captures attention itself, so every Python-level branch inside
+        ``forward_extend`` is frozen at capture time. We capture the cascade
+        (ragged current chunk + paged prefix + merge_state), which rules out:
+
+        * prefix-free batches — they take the ``extend_no_prefix`` shortcut, a
+          different captured shape. The first chunk of a fresh prompt falls
+          back to eager; later chunks (the bulk of a long prefill) replay.
+        * SWA / cross-attention models — the two-wrapper dispatch has no
+          blockwise-mask support, matching the eager path's NotImplementedError.
+        * paged-only FlashInfer — there the mask has to span prefix+extend, a
+          different shape than the ragged chunk mask we capture.
+
+        Callers must have already established a FlashInfer backend.
+        """
+        prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if prefix_lens_cpu is None or not any(prefix_lens_cpu):
+            return False
+        attn_backend = self.model_runner.attn_backend
+        return attn_backend.dispatch_reason is None and not attn_backend.use_paged
+
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         if forward_batch.dllm_config is not None:
             # Only scheduler-declared multi-block prefill may reuse the
@@ -726,12 +790,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             # semantics have parity coverage, require an exact capture bucket.
             if len(forward_batch.input_ids) not in self.capture_num_tokens:
                 return False
-            if not isinstance(self.backend, BreakableCudaGraphBackend):
+            if not isinstance(
+                self.backend, (BreakableCudaGraphBackend, FullCudaGraphBackend)
+            ):
                 return False
             device_type = torch.device(self.device).type
             if device_type != "cuda" or is_hip() or is_npu():
                 return False
             if not _is_flashinfer_attention_backend(self.model_runner.attn_backend):
+                return False
+            # Must stay below the FlashInfer check: it reads FlashInfer fields.
+            if self._is_full_backend and not self._can_run_full_dllm_graph(
+                forward_batch
+            ):
                 return False
         if self._is_full_backend and forward_batch.batch_size > self._capture_req_slots:
             return False
@@ -805,21 +876,35 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Slot 0 carries num_tokens; slots 1..bs-1 are zero-length sentinels.
         lens_cpu = [num_tokens] + [0] * (bs - 1)
         start_loc_cpu = [0] + [num_tokens] * (bs - 1)
+        # dLLM multi-block prefill captures the ragged+paged cascade, so slot 0
+        # needs a non-empty paged side at capture — with a zero prefix the paged
+        # wrapper plans an empty schedule and merge_state would be captured
+        # against it. One block is enough: Stage 0b showed a captured paged
+        # wrapper stays exact when replayed with 1024x the capture-time KV.
+        prefix_lens_cpu = [0] * bs
+        if self._capture_dllm_multi_block_prefill:
+            prefix_lens_cpu = [self._capture_dllm_prefix_len] + [0] * (bs - 1)
+        seq_lens_cpu = [
+            extend_len + prefix_len
+            for extend_len, prefix_len in zip(lens_cpu, prefix_lens_cpu)
+        ]
 
         with torch.device(self.device):
             shape_inputs = {
                 "req_pool_indices": torch.arange(bs, device=self.device),
-                "seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "orig_seq_lens": torch.tensor(lens_cpu, device=self.device),
+                "seq_lens": torch.tensor(seq_lens_cpu, device=self.device),
+                "orig_seq_lens": torch.tensor(seq_lens_cpu, device=self.device),
                 "extend_seq_lens": torch.tensor(lens_cpu, device=self.device),
-                "extend_prefix_lens": torch.zeros((bs,), dtype=torch.int64),
+                "extend_prefix_lens": torch.tensor(
+                    prefix_lens_cpu, dtype=torch.int64, device=self.device
+                ),
                 "extend_start_loc": torch.tensor(start_loc_cpu, device=self.device),
             }
         if self._prefill_static_buffers is not None:
             s = self._prefill_static_buffers
             s["seq_lens"][:bs].copy_(shape_inputs["seq_lens"])
             s["extend_seq_lens"][:bs].copy_(shape_inputs["extend_seq_lens"])
-            s["extend_prefix_lens"][:bs].zero_()
+            s["extend_prefix_lens"][:bs].copy_(shape_inputs["extend_prefix_lens"])
             s["extend_start_loc"][:bs].copy_(shape_inputs["extend_start_loc"])
             s["req_pool_indices"][:bs].copy_(
                 torch.arange(bs, device=s["req_pool_indices"].device)
@@ -864,9 +949,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 seq_lens=shape_inputs["seq_lens"],
                 next_token_logits_buffer=self._next_token_logits_buffer(bs),
                 orig_seq_lens=shape_inputs["orig_seq_lens"],
-                seq_lens_cpu=torch.tensor(lens_cpu, device="cpu"),
+                seq_lens_cpu=torch.tensor(seq_lens_cpu, device="cpu"),
                 out_cache_loc=_slot("out_cache_loc"),
-                seq_lens_sum=num_tokens,
+                seq_lens_sum=sum(seq_lens_cpu),
                 mamba_track_indices=(
                     _slot("mamba_track_indices")
                     if registry.has_slot("mamba_track_indices")
@@ -888,7 +973,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 extend_seq_lens=shape_inputs["extend_seq_lens"],
                 extend_prefix_lens=shape_inputs["extend_prefix_lens"],
                 extend_start_loc=shape_inputs["extend_start_loc"],
-                extend_prefix_lens_cpu=[0] * bs,
+                extend_prefix_lens_cpu=list(prefix_lens_cpu),
                 extend_seq_lens_cpu=list(lens_cpu),
                 extend_logprob_start_lens_cpu=list(lens_cpu),
                 positions=_slot("positions"),
@@ -913,6 +998,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
+                # dLLM identity so the attention backend captures the blockwise
+                # mask + ragged/paged cascade rather than plain EXTEND.
+                dllm_config=self._capture_dllm_config,
+                dllm_batch_mode=self._capture_dllm_batch_mode,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend

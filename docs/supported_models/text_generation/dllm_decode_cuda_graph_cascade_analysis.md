@@ -178,4 +178,3 @@ attention 实现，或先证明新的可见性仍可分解为互斥的完整 KV 
 | `python/sglang/srt/layers/attention/flashinfer_backend.py` | `prefix_lens`、ragged/paged wrapper metadata、两段 `forward_return_lse` 与 `_safe_merge_state`。 |
 | `python/sglang/srt/layers/attention/triton_ops/merge_state.py` | FlashInfer 原生 merge 不适用时的等价 Triton 合并实现。 |
 | `docs/supported_models/text_generation/dllm_prefill_scheduling_design.md` | dLLM prefill/decode phase 和 forward mode 的整体设计。 |
-

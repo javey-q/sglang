@@ -687,6 +687,94 @@ class TestPrefillAdder(CustomTestCase):
             forward_batch.input_ids = [1] * 31
             self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, forward_batch))
 
+    def test_dllm_full_cuda_graph_capability_gate(self):
+        """Full CG captures attention, so the cascade branch is frozen at capture.
+
+        Unlike BCG (attention runs eagerly between segments, so every batch
+        shape is fine), the Full backend bakes forward_extend's Python-level
+        ``extend_no_prefix`` choice and the wrapper dispatch into the graph.
+        Admitting a batch that would have taken a different branch replays the
+        wrong captured shape and silently returns wrong attention output, so
+        the gate — not a runtime assert — is the only guard.
+        """
+
+        class FakeFullBackend:
+            pass
+
+        runner = SimpleNamespace(
+            backend=FakeFullBackend(),
+            capture_num_tokens=[32, 128],
+            capture_hidden_mode=None,
+            device="cuda",
+            max_num_tokens=128,
+            model_runner=SimpleNamespace(
+                attn_backend=SimpleNamespace(dispatch_reason=None, use_paged=False)
+            ),
+            _is_full_backend=True,
+            _capture_req_slots=4,
+            _has_unsupported_mha_prefix=lambda _batch: False,
+            _has_inactive_dp_rank=lambda _batch: False,
+            _pad_to_bucket=lambda raw_size, buckets: next(
+                bucket for bucket in buckets if bucket >= raw_size
+            ),
+        )
+        runner._can_run_full_dllm_graph = (
+            lambda batch: PrefillCudaGraphRunner._can_run_full_dllm_graph(
+                runner, batch
+            )
+        )
+        forward_batch = SimpleNamespace(
+            dllm_config=SimpleNamespace(),
+            is_dllm_multi_block_prefill=True,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=[1] * 32,
+            input_embeds=None,
+            replace_embeds=None,
+            mm_inputs=None,
+            capture_hidden_mode=None,
+            global_num_tokens_cpu=None,
+            return_logprob=False,
+            batch_size=2,
+            extend_prefix_lens_cpu=[64, 96],
+        )
+        module = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner"
+        with (
+            patch(f"{module}.FullCudaGraphBackend", FakeFullBackend),
+            patch(f"{module}._is_flashinfer_attention_backend", return_value=True),
+            patch(f"{module}.is_hip", return_value=False),
+            patch(f"{module}.is_npu", return_value=False),
+        ):
+            self.assertTrue(PrefillCudaGraphRunner.can_run_graph(runner, forward_batch))
+
+            # A prefix-free batch takes forward_extend's extend_no_prefix
+            # shortcut, which is not the captured shape.
+            forward_batch.extend_prefix_lens_cpu = [0, 0]
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            forward_batch.extend_prefix_lens_cpu = [64, 96]
+
+            # SWA / cross-attention dispatch has no blockwise-mask support.
+            runner.model_runner.attn_backend.dispatch_reason = object()
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            runner.model_runner.attn_backend.dispatch_reason = None
+
+            # Paged-only FlashInfer needs a prefix+extend mask, not the ragged
+            # chunk mask the graph was captured with.
+            runner.model_runner.attn_backend.use_paged = True
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+            runner.model_runner.attn_backend.use_paged = False
+
+            # Batches wider than the baked-in request slots stay eager.
+            forward_batch.batch_size = 5
+            self.assertFalse(
+                PrefillCudaGraphRunner.can_run_graph(runner, forward_batch)
+            )
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),
