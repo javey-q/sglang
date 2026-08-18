@@ -236,6 +236,10 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # dLLM pure prefill: the batch only commits prompt KV, and the scheduler
+    # discards this forward's logits outright, so the LM head can be skipped.
+    is_dllm_prefill: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
@@ -289,6 +293,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            is_dllm_prefill=forward_batch.is_dllm_prefill,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -402,6 +407,18 @@ class LogitsProcessor(nn.Module):
         # Placed before the MIS / DLLM / common dispatch so all three LM-head
         # paths are skipped.
         if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
+
+        # dLLM pure prefill commits prompt KV and produces no token: the
+        # scheduler drops the whole logits_output without reading it (see
+        # SchedulerDllmMixin.process_batch_result_dllm). Computing it is pure
+        # waste, so skip the LM head the same way the autotune dummy run does.
+        # Requesting hidden states or logprobs keeps the normal path.
+        if (
+            logits_metadata.is_dllm_prefill
+            and not logits_metadata.capture_hidden_mode.need_capture()
+            and not logits_metadata.extend_return_logprob
+        ):
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
